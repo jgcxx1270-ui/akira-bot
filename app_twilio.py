@@ -78,7 +78,7 @@ def whatsapp_webhook():
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Akira WhatsApp Bot ON", 200
+    return "AKIRA V2 — ON ✅", 200
 
 @app.route("/healthz", methods=["GET"])
 def health():
@@ -87,3 +87,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
