@@ -1,0 +1,8 @@
+flask
+python-dotenv
+openai
+twilio
+requests
+pdfminer.six
+python-docx
+Pillow
