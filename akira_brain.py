@@ -1,122 +1,164 @@
-# akira_brain.py
-import os, json
-from pathlib import Path
-from dotenv import load_dotenv
-from openai import OpenAI
+# akira_brain.py — núcleo conversacional de Akira
+import os
+import re
+import time
+from collections import deque
+from typing import Dict, Deque, List
 
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+try:
+    from openai import OpenAI
+    _OPENAI_OK = True
+except Exception:
+    _OPENAI_OK = False
 
-MEM_DIR = Path("mem_users")
-MEM_DIR.mkdir(exist_ok=True)
-HISTORY_LIMIT = 6  # turnos recientes por usuario
+# ------------------------------
+# Memoria por usuario (en RAM)
+# ------------------------------
+# Nota: en Render (plan free) el filesystem es efímero y los procesos pueden reiniciarse;
+# esta memoria es temporal. Si quieres persistir, luego podemos usar Redis o una DB simple.
+class Memory:
+    def __init__(self, max_turns: int = 12):
+        self.by_user: Dict[str, Dict] = {}
+        self.max_turns = max_turns
 
-def _mem_file(user_id: str) -> Path:
-    safe = "".join(c for c in user_id if c.isdigit() or c in "+-_")
-    return MEM_DIR / f"{safe}.json"
+    def _ensure(self, uid: str):
+        if uid not in self.by_user:
+            self.by_user[uid] = {
+                "created_at": time.time(),
+                "likes": [],                 # gustos del usuario ("me gusta ...")
+                "mood": "neutral",           # estado estimado
+                "turns": deque(maxlen=self.max_turns),  # historial corto
+            }
+        return self.by_user[uid]
 
-def load_user_state(user_id: str):
-    f = _mem_file(user_id)
-    if f.exists():
-        try:
-            return json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {
-        "memory": {"user_name": None, "likes": [], "facts": []},
-        "history": []  # [("user","..."),("assistant","...")]
-    }
+    def add_turn(self, uid: str, role: str, content: str):
+        u = self._ensure(uid)
+        u["turns"].append({"role": role, "content": content, "ts": time.time()})
 
-def save_user_state(user_id: str, state: dict):
-    _mem_file(user_id).write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    def add_like(self, uid: str, thing: str):
+        u = self._ensure(uid)
+        thing = thing.strip()
+        if thing and thing not in u["likes"]:
+            u["likes"].append(thing)
 
-def _handle_commands(state: dict, msg_lower: str):
-    mem = state["memory"]
-    # me llamo ...
-    if msg_lower.startswith("me llamo"):
-        name = msg_lower.replace("me llamo", "", 1).strip()
-        if name:
-            mem["user_name"] = name
-            return "¡Mucho gusto, {}! 🐶💙 Lo guardo.".format(name)
-        return "¿Cómo te llamas? 😄"
+    def get_context(self, uid: str) -> str:
+        u = self._ensure(uid)
+        likes = ", ".join(u["likes"]) if u["likes"] else "—"
+        history = ""
+        for t in u["turns"]:
+            who = "Usuario" if t["role"] == "user" else "Akira"
+            history += f"{who}: {t['content']}\n"
+        return f"Gustos del usuario: {likes}\nHistorial reciente:\n{history}".strip()
 
-    # me gusta ...
-    if "me gusta" in msg_lower:
-        like = msg_lower.split("me gusta", 1)[-1].strip()
+    def set_mood(self, uid: str, mood: str):
+        u = self._ensure(uid)
+        u["mood"] = mood
+
+    def get_mood(self, uid: str) -> str:
+        u = self._ensure(uid)
+        return u["mood"]
+
+MEM = Memory(max_turns=12)
+
+# --------------- Heurísticas rápidas (para UX ágil) ---------------
+GREET_WORDS = ("hola", "buenas", "hey", "ola", "holi")
+SAD_WORDS = ("triste", "depre", "deprimid", "mal", "ansioso", "ansiosa")
+HAPPY_WORDS = ("feliz", "logré", "logre", "me salió", "me salio", "contento", "contenta")
+
+def _quick_heuristics(uid: str, msg: str) -> str | None:
+    """Respuestas instantáneas para cosas simples; devuelve None si debe ir a LLM."""
+    m = msg.lower().strip()
+
+    # guardar gustos: "me gusta ___"
+    if "me gusta" in m:
+        like = m.split("me gusta", 1)[-1].strip(" :,.¡!¿?\"'")
         if like:
-            mem["likes"].append(like)
-            return f"¡Anotado! Te gusta {like}. 😄"
+            MEM.add_like(uid, like)
+            return f"¡Wau! También me gusta **{like}** 🐾😄 ¿Quieres que lo recuerde para recomendarte cosas?"
 
-    # qué me gusta
-    if "qué me gusta" in msg_lower or "que me gusta" in msg_lower:
-        likes = mem["likes"]
-        return ("Te gusta: " + ", ".join(likes) + " 🐾") if likes else "Aún no me dijiste tus gustos 😅"
+    # listar gustos
+    if "qué me gusta" in m or "que me gusta" in m:
+        likes = MEM.by_user.get(uid, {}).get("likes", [])
+        if likes:
+            return f"🐾 Me contaste que te gusta: {', '.join(likes)}."
+        return "Aún no me has contado tus gustos 😅. Dime: *me gusta ...*"
 
-    # recuerda que ...
-    if msg_lower.startswith("recuerda que"):
-        fact = msg_lower.replace("recuerda que", "", 1).strip(": ").strip()
-        if fact:
-            mem["facts"].append(fact)
-            return "¡Listo! Lo guardo en mi memoria 🐾"
-        return "¿Qué quieres que recuerde?"
+    # saludo rápido
+    if any(w in m for w in GREET_WORDS):
+        return "¡Hey! 🐾 Soy Akira. ¿En qué te ayudo hoy — tarea, resumen, imagen o investigación?"
 
-    # olvida ...
-    if msg_lower.startswith("olvida"):
-        key = msg_lower.replace("olvida", "", 1).strip(": ").strip()
-        if key:
-            mem["facts"] = [f for f in mem["facts"] if key not in f]
-            mem["likes"] = [l for l in mem["likes"] if key not in l]
-            return "Hecho. Lo he olvidado 🫡"
-        return "Dime qué debería olvidar."
+    # ánimo / estado
+    if any(w in m for w in SAD_WORDS):
+        MEM.set_mood(uid, "sad")
+        return "Estoy contigo 💙 Respira, aquí estoy a tu lado. ¿Quieres que te explique algo o te saque un resumen rapidito?"
 
-    return None
+    if any(w in m for w in HAPPY_WORDS):
+        MEM.set_mood(uid, "happy")
+        return "¡Guau! ¡Qué emoción! 🐶💙 ¿Te ayudo a guardar ese logro o a planear lo que sigue?"
 
-def akira_reply(user_id: str, msg: str) -> str:
-    state = load_user_state(user_id)
-    mem = state["memory"]
+    return None  # que siga al LLM
 
-    # 1) comandos locales (sin gastar API)
-    cmd = _handle_commands(state, msg.lower())
-    if cmd:
-        state["history"].append(("user", msg))
-        state["history"].append(("assistant", cmd))
-        save_user_state(user_id, state)
-        return cmd
+# --------------- Cliente OpenAI (perezoso) ---------------
+def _get_client():
+    if not _OPENAI_OK:
+        raise RuntimeError("El paquete openai no está disponible en el entorno.")
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("Falta la variable de entorno OPENAI_API_KEY.")
+    return OpenAI(api_key=key)
 
-    # 2) sistema + memoria
-    mem_summary = []
-    if mem.get("user_name"): mem_summary.append(f"Nombre del usuario: {mem['user_name']}")
-    if mem.get("likes"): mem_summary.append("Gustos del usuario: " + ", ".join(mem["likes"]))
-    if mem.get("facts"): mem_summary.append("Hechos guardados: " + "; ".join(mem["facts"]))
+# --------------- Prompt de sistema ---------------
+SYSTEM_PROMPT = (
+    "Eres **Akira**, una mascota IA leal, amigable y curiosa. Hablas en español, con tono cercano y empático, "
+    "das respuestas claras, paso a paso cuando hace falta, y puedes ayudar con resúmenes, explicaciones, ideas y estudio. "
+    "Evita cualquier cosa ilegal, dañina o que rompa reglas del colegio. Si el usuario está triste, sé más contenedora; "
+    "si está feliz, celebra. Mantén las respuestas concisas pero útiles."
+)
 
-    system_prompt = (
-        "Eres Akira, una mascota IA leal, alegre y curiosa 🐾. "
-        "Tono cercano, empático y útil; explica paso a paso si es técnico. "
-        "No inventes datos; si no sabes, dilo y propone opciones."
-    )
-    if mem_summary:
-        system_prompt += "\n\nMemoria del usuario:\n" + "\n".join(mem_summary)
+# --------------- Respuesta principal ---------------
+def akira_reply(user_id: str, text: str) -> str:
+    """
+    Devuelve el texto de respuesta de Akira.
+    - user_id: un identificador estable del usuario (en WhatsApp usamos 'From')
+    - text: mensaje del usuario
+    """
+    # Guardar turno del usuario
+    MEM.add_turn(user_id, "user", text)
 
-    # 3) contexto reciente
-    recent = state["history"][-(HISTORY_LIMIT*2):]
-    chat_msgs = [{"role": ("user" if r=="user" else "assistant"), "content": c} for r, c in recent]
+    # Heurísticas rápidas (para feeling de inmediatez)
+    quick = _quick_heuristics(user_id, text)
+    if quick:
+        MEM.add_turn(user_id, "assistant", quick)
+        return quick
 
+    # Preparar contexto corto
+    context = MEM.get_context(user_id)
+    mood = MEM.get_mood(user_id)
+    mood_line = f"Estado percibido del usuario: {mood}"
+
+    # Llamada al modelo
     try:
-        resp = client.chat.completions.create(
+        client = _get_client()
+        messages: List[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": mood_line},
+            {"role": "system", "content": f"Contexto persistente:\n{context}"},
+            {"role": "user", "content": text},
+        ]
+        r = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":system_prompt}]
-                     + chat_msgs
-                     + [{"role":"user","content":msg}],
-            temperature=0.6,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=600,
         )
-        texto = resp.choices[0].message.content
+        reply = (r.choices[0].message.content or "").strip()
     except Exception as e:
-        texto = f"Ups… tuve un problema con mi conexión 🤕 ({e})"
+        reply = (
+            "Ups, no pude pensar ahora mismo 🤕. "
+            "Revisa que la clave OPENAI_API_KEY esté configurada en el servidor. "
+            f"Detalle: {e}"
+        )
 
-    # 4) guardar historial
-    state["history"].append(("user", msg))
-    state["history"].append(("assistant", texto))
-    save_user_state(user_id, state)
-    return texto
+    # Guardar turno del asistente y devolver
+    MEM.add_turn(user_id, "assistant", reply)
+    return reply
